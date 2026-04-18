@@ -1497,6 +1497,7 @@ def _build_call_kwargs(
         "model": model,
         "messages": messages,
         "timeout": timeout,
+        "stream": True,  # Always stream — some OpenAI-compatible endpoints (GLM, CodeBuddy) reject non-streaming
     }
 
     if temperature is not None:
@@ -1525,6 +1526,232 @@ def _build_call_kwargs(
         kwargs["extra_body"] = merged_extra
 
     return kwargs
+
+
+def _collect_stream_response(stream) -> Any:
+    """Collect a streaming response into a mock non-streaming response object.
+
+    Some OpenAI-compatible API endpoints (e.g. GLM/Zhipu, CodeBuddy) only
+    support streaming chat completions and reject non-streaming requests with
+    errors like "Non-stream chat request is currently not supported".
+
+    This function iterates over a streaming response, collects content chunks,
+    tool call deltas, usage stats, etc., and returns a SimpleNamespace object
+    that is compatible with ``extract_content_or_reasoning()`` and other
+    downstream consumers that expect a non-streaming response format
+    (``response.choices[0].message.content``).
+
+    Args:
+        stream: An OpenAI streaming response iterator.
+
+    Returns:
+        A SimpleNamespace with ``.choices[0].message.content`` (and optional
+        reasoning/tool_calls fields) matching the non-streaming response shape.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_call_buffers: dict[int, dict] = {}  # index -> {id, name, arguments_str}
+    usage_data = None
+    finish_reason = None
+    model_name = None
+
+    for chunk in stream:
+        # Capture model name from first chunk
+        if model_name is None and getattr(chunk, "model", None):
+            model_name = chunk.model
+
+        if not chunk.choices:
+            # Some providers emit chunks with empty choices (e.g. usage-only)
+            if getattr(chunk, "usage", None):
+                usage_data = chunk.usage
+            continue
+
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish_reason = choice.finish_reason
+
+        delta = choice.delta
+
+        # Collect text content
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+
+        # Collect reasoning content (DeepSeek, etc.)
+        for rfield in ("reasoning", "reasoning_content"):
+            rval = getattr(delta, rfield, None)
+            if rval:
+                reasoning_parts.append(rval)
+
+        # Collect reasoning_details (OpenRouter format)
+        if getattr(delta, "reasoning_details", None):
+            for detail in delta.reasoning_details:
+                if isinstance(detail, dict):
+                    summary = detail.get("summary") or detail.get("content") or detail.get("text")
+                    if summary:
+                        reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+
+        # Collect tool call deltas
+        if getattr(delta, "tool_calls", None):
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index if hasattr(tc_delta, "index") and tc_delta.index is not None else 0
+                if idx not in tool_call_buffers:
+                    tool_call_buffers[idx] = {"id": "", "name": "", "arguments_str": ""}
+                buf = tool_call_buffers[idx]
+                if getattr(tc_delta, "id", None):
+                    buf["id"] = tc_delta.id
+                if getattr(tc_delta, "function", None):
+                    if getattr(tc_delta.function, "name", None):
+                        buf["name"] = tc_delta.function.name
+                    if getattr(tc_delta.function, "arguments", None):
+                        buf["arguments_str"] += tc_delta.function.arguments
+
+        # Usage is sometimes on the last chunk
+        if getattr(chunk, "usage", None):
+            usage_data = chunk.usage
+
+    # Assemble the mock response object
+    full_content = "".join(content_parts) or None
+    full_reasoning = "".join(reasoning_parts) or None
+
+    # Build tool_calls list if any
+    tool_calls_list = None
+    if tool_call_buffers:
+        from openai.types.chat import ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+        import json as _json
+
+        tool_calls_list = []
+        for idx in sorted(tool_call_buffers.keys()):
+            buf = tool_call_buffers[idx]
+            try:
+                args_obj = _json.loads(buf["arguments_str"]) if buf["arguments_str"] else {}
+            except _json.JSONDecodeError:
+                args_obj = {}
+            tool_calls_list.append(ChatCompletionMessageToolCall(
+                id=buf["id"] or f"call_{idx}",
+                type="function",
+                function=Function(name=buf["name"], arguments=_json.dumps(args_obj)),
+            ))
+
+    # Build message object compatible with extract_content_or_reasoning()
+    msg = SimpleNamespace(
+        content=full_content,
+        reasoning=full_reasoning,
+        reasoning_content=full_reasoning,
+        reasoning_details=None,
+        tool_calls=tool_calls_list,
+    )
+    choice_obj = SimpleNamespace(
+        message=msg,
+        finish_reason=finish_reason or "stop",
+        index=0,
+    )
+
+    result = SimpleNamespace(
+        choices=[choice_obj],
+        model=model_name or "",
+        usage=usage_data,
+    )
+    return result
+
+
+async def _async_collect_stream_response(stream) -> Any:
+    """Async version of _collect_stream_response()."""
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_call_buffers: dict[int, dict] = {}
+    usage_data = None
+    finish_reason = None
+    model_name = None
+
+    async for chunk in stream:
+        if model_name is None and getattr(chunk, "model", None):
+            model_name = chunk.model
+
+        if not chunk.choices:
+            if getattr(chunk, "usage", None):
+                usage_data = chunk.usage
+            continue
+
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish_reason = choice.finish_reason
+
+        delta = choice.delta
+
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+
+        for rfield in ("reasoning", "reasoning_content"):
+            rval = getattr(delta, rfield, None)
+            if rval:
+                reasoning_parts.append(rval)
+
+        if getattr(delta, "reasoning_details", None):
+            for detail in delta.reasoning_details:
+                if isinstance(detail, dict):
+                    summary = detail.get("summary") or detail.get("content") or detail.get("text")
+                    if summary:
+                        reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+
+        if getattr(delta, "tool_calls", None):
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index if hasattr(tc_delta, "index") and tc_delta.index is not None else 0
+                if idx not in tool_call_buffers:
+                    tool_call_buffers[idx] = {"id": "", "name": "", "arguments_str": ""}
+                buf = tool_call_buffers[idx]
+                if getattr(tc_delta, "id", None):
+                    buf["id"] = tc_delta.id
+                if getattr(tc_delta, "function", None):
+                    if getattr(tc_delta.function, "name", None):
+                        buf["name"] = tc_delta.function.name
+                    if getattr(tc_delta.function, "arguments", None):
+                        buf["arguments_str"] += tc_delta.function.arguments
+
+        if getattr(chunk, "usage", None):
+            usage_data = chunk.usage
+
+    full_content = "".join(content_parts) or None
+    full_reasoning = "".join(reasoning_parts) or None
+
+    tool_calls_list = None
+    if tool_call_buffers:
+        from openai.types.chat import ChatCompletionMessageToolCall
+        from openai.types.chat.chat_completion_message_tool_call import Function
+        import json as _json
+
+        tool_calls_list = []
+        for idx in sorted(tool_call_buffers.keys()):
+            buf = tool_call_buffers[idx]
+            try:
+                args_obj = _json.loads(buf["arguments_str"]) if buf["arguments_str"] else {}
+            except _json.JSONDecodeError:
+                args_obj = {}
+            tool_calls_list.append(ChatCompletionMessageToolCall(
+                id=buf["id"] or f"call_{idx}",
+                type="function",
+                function=Function(name=buf["name"], arguments=_json.dumps(args_obj)),
+            ))
+
+    msg = SimpleNamespace(
+        content=full_content,
+        reasoning=full_reasoning,
+        reasoning_content=full_reasoning,
+        reasoning_details=None,
+        tool_calls=tool_calls_list,
+    )
+    choice_obj = SimpleNamespace(
+        message=msg,
+        finish_reason=finish_reason or "stop",
+        index=0,
+    )
+
+    result = SimpleNamespace(
+        choices=[choice_obj],
+        model=model_name or "",
+        usage=usage_data,
+    )
+    return result
 
 
 def call_llm(
@@ -1630,14 +1857,18 @@ def call_llm(
         base_url=resolved_base_url)
 
     # Handle max_tokens vs max_completion_tokens retry
+    # Since we always stream, collect the stream into a response object
+    # compatible with extract_content_or_reasoning().
     try:
-        return client.chat.completions.create(**kwargs)
+        stream = client.chat.completions.create(**kwargs)
+        return _collect_stream_response(stream)
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
-            return client.chat.completions.create(**kwargs)
+            stream = client.chat.completions.create(**kwargs)
+            return _collect_stream_response(stream)
         raise
 
 
@@ -1778,11 +2009,13 @@ async def async_call_llm(
         base_url=resolved_base_url)
 
     try:
-        return await client.chat.completions.create(**kwargs)
+        stream = await client.chat.completions.create(**kwargs)
+        return await _async_collect_stream_response(stream)
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
-            return await client.chat.completions.create(**kwargs)
+            stream = await client.chat.completions.create(**kwargs)
+            return await _async_collect_stream_response(stream)
         raise
