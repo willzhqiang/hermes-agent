@@ -2558,6 +2558,232 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
 
 
 
+def _is_openai_native_client(client: Any) -> bool:
+    """True when ``client`` is a stock OpenAI SDK client (sync or async).
+
+    Adapter wrappers (``CodexAuxiliaryClient``, ``AnthropicAuxiliaryClient``,
+    ``AsyncAuxiliaryClient``) manage their own request lifecycle and
+    return non-streaming ``SimpleNamespace`` responses internally, so we
+    must not force ``stream=True`` on them.
+    """
+    try:
+        from openai import OpenAI as _SyncOpenAI, AsyncOpenAI as _AsyncOpenAI
+    except ImportError:
+        return False
+    return isinstance(client, (_SyncOpenAI, _AsyncOpenAI))
+
+
+def _collect_stream_response(stream) -> Any:
+    """Collect a streaming chat.completions response into a mock non-stream object.
+
+    Some OpenAI-compatible endpoints (CodeBuddy, GLM/Zhipu) only accept
+    ``stream=True`` and reject non-stream requests with
+    ``"Non-stream chat request is currently not supported"``. Downstream
+    auxiliary consumers (``extract_content_or_reasoning()``, vision_tools,
+    etc.) all expect ``response.choices[0].message.content``, so we fold the
+    stream back into that shape.
+    """
+    import json as _json
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_call_buffers: dict[int, dict] = {}
+    usage_data = None
+    finish_reason = None
+    model_name = None
+
+    for chunk in stream:
+        if model_name is None and getattr(chunk, "model", None):
+            model_name = chunk.model
+        if not chunk.choices:
+            if getattr(chunk, "usage", None):
+                usage_data = chunk.usage
+            continue
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish_reason = choice.finish_reason
+        delta = choice.delta
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+        for rfield in ("reasoning", "reasoning_content"):
+            rval = getattr(delta, rfield, None)
+            if rval:
+                reasoning_parts.append(rval)
+        if getattr(delta, "reasoning_details", None):
+            for detail in delta.reasoning_details:
+                if isinstance(detail, dict):
+                    summary = detail.get("summary") or detail.get("content") or detail.get("text")
+                    if summary:
+                        reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+        if getattr(delta, "tool_calls", None):
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index if getattr(tc_delta, "index", None) is not None else 0
+                buf = tool_call_buffers.setdefault(idx, {"id": "", "name": "", "arguments_str": ""})
+                if getattr(tc_delta, "id", None):
+                    buf["id"] = tc_delta.id
+                fn = getattr(tc_delta, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        buf["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        buf["arguments_str"] += fn.arguments
+        if getattr(chunk, "usage", None):
+            usage_data = chunk.usage
+
+    tool_calls_list = None
+    if tool_call_buffers:
+        try:
+            from openai.types.chat import ChatCompletionMessageToolCall
+            from openai.types.chat.chat_completion_message_tool_call import Function
+            tool_calls_list = []
+            for idx in sorted(tool_call_buffers.keys()):
+                buf = tool_call_buffers[idx]
+                try:
+                    args_obj = _json.loads(buf["arguments_str"]) if buf["arguments_str"] else {}
+                except _json.JSONDecodeError:
+                    args_obj = {}
+                tool_calls_list.append(ChatCompletionMessageToolCall(
+                    id=buf["id"] or f"call_{idx}",
+                    type="function",
+                    function=Function(name=buf["name"], arguments=_json.dumps(args_obj)),
+                ))
+        except Exception:
+            tool_calls_list = None
+
+    msg = SimpleNamespace(
+        content="".join(content_parts) or None,
+        reasoning="".join(reasoning_parts) or None,
+        reasoning_content="".join(reasoning_parts) or None,
+        reasoning_details=None,
+        tool_calls=tool_calls_list,
+    )
+    choice_obj = SimpleNamespace(
+        message=msg,
+        finish_reason=finish_reason or "stop",
+        index=0,
+    )
+    return SimpleNamespace(
+        choices=[choice_obj],
+        model=model_name or "",
+        usage=usage_data,
+    )
+
+
+async def _async_collect_stream_response(stream) -> Any:
+    """Async version of :func:`_collect_stream_response`."""
+    import json as _json
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_call_buffers: dict[int, dict] = {}
+    usage_data = None
+    finish_reason = None
+    model_name = None
+
+    async for chunk in stream:
+        if model_name is None and getattr(chunk, "model", None):
+            model_name = chunk.model
+        if not chunk.choices:
+            if getattr(chunk, "usage", None):
+                usage_data = chunk.usage
+            continue
+        choice = chunk.choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish_reason = choice.finish_reason
+        delta = choice.delta
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+        for rfield in ("reasoning", "reasoning_content"):
+            rval = getattr(delta, rfield, None)
+            if rval:
+                reasoning_parts.append(rval)
+        if getattr(delta, "reasoning_details", None):
+            for detail in delta.reasoning_details:
+                if isinstance(detail, dict):
+                    summary = detail.get("summary") or detail.get("content") or detail.get("text")
+                    if summary:
+                        reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
+        if getattr(delta, "tool_calls", None):
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index if getattr(tc_delta, "index", None) is not None else 0
+                buf = tool_call_buffers.setdefault(idx, {"id": "", "name": "", "arguments_str": ""})
+                if getattr(tc_delta, "id", None):
+                    buf["id"] = tc_delta.id
+                fn = getattr(tc_delta, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        buf["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        buf["arguments_str"] += fn.arguments
+        if getattr(chunk, "usage", None):
+            usage_data = chunk.usage
+
+    tool_calls_list = None
+    if tool_call_buffers:
+        try:
+            from openai.types.chat import ChatCompletionMessageToolCall
+            from openai.types.chat.chat_completion_message_tool_call import Function
+            tool_calls_list = []
+            for idx in sorted(tool_call_buffers.keys()):
+                buf = tool_call_buffers[idx]
+                try:
+                    args_obj = _json.loads(buf["arguments_str"]) if buf["arguments_str"] else {}
+                except _json.JSONDecodeError:
+                    args_obj = {}
+                tool_calls_list.append(ChatCompletionMessageToolCall(
+                    id=buf["id"] or f"call_{idx}",
+                    type="function",
+                    function=Function(name=buf["name"], arguments=_json.dumps(args_obj)),
+                ))
+        except Exception:
+            tool_calls_list = None
+
+    msg = SimpleNamespace(
+        content="".join(content_parts) or None,
+        reasoning="".join(reasoning_parts) or None,
+        reasoning_content="".join(reasoning_parts) or None,
+        reasoning_details=None,
+        tool_calls=tool_calls_list,
+    )
+    choice_obj = SimpleNamespace(
+        message=msg,
+        finish_reason=finish_reason or "stop",
+        index=0,
+    )
+    return SimpleNamespace(
+        choices=[choice_obj],
+        model=model_name or "",
+        usage=usage_data,
+    )
+
+
+def _create_chat_completion(client: Any, kwargs: dict) -> Any:
+    """Sync ``chat.completions.create`` that transparently uses streaming when
+    the client is a native OpenAI SDK instance.
+
+    Motivation: some OpenAI-compatible endpoints (CodeBuddy
+    ``tencent.sso.codebuddy.cn``, GLM/Zhipu) reject non-stream requests with
+    HTTP 400 ``11101 "Non-stream chat request is currently not supported"``.
+    Forcing ``stream=True`` only for native OpenAI clients and collecting
+    the stream keeps the downstream contract (``choices[0].message.content``)
+    intact, without breaking Codex / Anthropic adapter wrappers.
+    """
+    if not _is_openai_native_client(client):
+        return client.chat.completions.create(**kwargs)
+    stream_kwargs = dict(kwargs)
+    stream_kwargs["stream"] = True
+    stream = client.chat.completions.create(**stream_kwargs)
+    return _collect_stream_response(stream)
+
+
+async def _async_create_chat_completion(client: Any, kwargs: dict) -> Any:
+    """Async version of :func:`_create_chat_completion`."""
+    if not _is_openai_native_client(client):
+        return await client.chat.completions.create(**kwargs)
+    stream_kwargs = dict(kwargs)
+    stream_kwargs["stream"] = True
+    stream = await client.chat.completions.create(**stream_kwargs)
+    return await _async_collect_stream_response(stream)
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -2778,7 +3004,7 @@ def call_llm(
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
         return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
+            _create_chat_completion(client, kwargs), task)
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
@@ -2786,7 +3012,7 @@ def call_llm(
             kwargs["max_completion_tokens"] = max_tokens
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                    _create_chat_completion(client, kwargs), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -2848,7 +3074,7 @@ def call_llm(
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                    _create_chat_completion(fb_client, fb_kwargs), task)
         raise
 
 
@@ -2999,7 +3225,7 @@ async def async_call_llm(
 
     try:
         return _validate_llm_response(
-            await client.chat.completions.create(**kwargs), task)
+            await _async_create_chat_completion(client, kwargs), task)
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
@@ -3007,7 +3233,7 @@ async def async_call_llm(
             kwargs["max_completion_tokens"] = max_tokens
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
+                    await _async_create_chat_completion(client, kwargs), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -3058,5 +3284,5 @@ async def async_call_llm(
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
                 return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
+                    await _async_create_chat_completion(async_fb, fb_kwargs), task)
         raise
